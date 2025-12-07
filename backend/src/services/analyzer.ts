@@ -206,9 +206,19 @@ export async function analyzeLinksWithAI(
     heuristics: calculateHeuristics(link)
   }));
   
-  // Step 2: Check uncached links with external services in parallel
+  // Step 2: Check uncached links with external services in parallel (skip for trusted domains)
   const externalCheckResults = await Promise.all(
     linksToAnalyze.map(async ({ link }) => {
+      // Skip external checks for trusted domains (they're already safe)
+      if (isTrustedDomain(link.targetDomain)) {
+        return {
+          safe: true,
+          confidence: 1.0,
+          sources: [],
+          threatCount: 0
+        } as AggregatedCheckResult;
+      }
+      
       try {
         return await checkExternalServices(link);
       } catch (err) {
@@ -297,10 +307,12 @@ export async function analyzeLinksWithAI(
     // Store initial analysis (return immediately)
     analyses[originalIndex] = { link, verdict };
     
-    // Speed optimization: Fast-check - skip AI for obviously dangerous links
+    // Speed optimization: Fast-check - skip AI for obviously dangerous/safe links
     // If trust score is very low (< 0.2) and external checks confirm danger, skip AI
     const isObviouslyDangerous = trustScore < 0.2 && externalResult.threatCount > 0;
-    const isObviouslySafe = trustScore > 0.85 && externalResult.safe && externalResult.confidence > 0.8;
+    // More aggressive safe detection: if trust score is high (> 0.8) and no issues, skip AI
+    const isObviouslySafe = (trustScore > 0.8 && allIssues.length === 0) || 
+                           (trustScore > 0.85 && externalResult.safe && externalResult.confidence > 0.8);
     
     // Queue for AI analysis (skip obviously dangerous/safe links for speed)
     const allowAIWithoutAuth = process.env.ALLOW_AI_WITHOUT_AUTH === 'true';
@@ -858,6 +870,9 @@ async function getUserPlan(userId: string): Promise<{ plan: string; trial_expire
   return result.rows[0] || null;
 }
 
+// In-memory lock to prevent concurrent storage of the same URL
+const storageLocks = new Map<string, Promise<void>>();
+
 async function storeScanResult(
   userId: string | null,
   link: LinkMeta,
@@ -867,120 +882,96 @@ async function storeScanResult(
 ): Promise<void> {
   const normalizedUrl = normalizeUrl(link.href);
   
-  try {
-    
-    // Use INSERT with ON CONFLICT to update if exists (within cache TTL) or insert new
-    await pool.query(
-      `INSERT INTO link_scans (
-        user_id, domain, url, link_text, detected_issues, trust_score, 
-        gpt_summary, ollama_analysis, external_checks, recommendation, 
-        risk_tags, confidence, category, updated_at
-      )
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, NOW())
-      ON CONFLICT (url) 
-      DO UPDATE SET
-        user_id = COALESCE(EXCLUDED.user_id, link_scans.user_id),
-        domain = EXCLUDED.domain,
-        link_text = EXCLUDED.link_text,
-        detected_issues = EXCLUDED.detected_issues,
-        trust_score = EXCLUDED.trust_score,
-        gpt_summary = COALESCE(EXCLUDED.gpt_summary, link_scans.gpt_summary),
-        ollama_analysis = COALESCE(EXCLUDED.ollama_analysis, link_scans.ollama_analysis),
-        external_checks = COALESCE(EXCLUDED.external_checks, link_scans.external_checks),
-        recommendation = COALESCE(EXCLUDED.recommendation, link_scans.recommendation),
-        risk_tags = COALESCE(EXCLUDED.risk_tags, link_scans.risk_tags),
-        confidence = COALESCE(EXCLUDED.confidence, link_scans.confidence),
-        category = EXCLUDED.category,
-        updated_at = NOW()
-      WHERE link_scans.created_at < NOW() - INTERVAL '${CACHE_TTL_HOURS} hours'`,
-      [
-        userId,
-        link.targetDomain,
-        normalizedUrl,
-        link.text,
-        JSON.stringify(verdict.issues),
-        verdict.trustScore,
-        verdict.gptSummary || null,
-        ollamaResult ? JSON.stringify(ollamaResult) : null,
-        externalResult ? JSON.stringify(externalResult) : null,
-        verdict.recommendation || null,
-        verdict.riskTags ? JSON.stringify(verdict.riskTags) : null,
-        verdict.confidence || null,
-        verdict.category
-      ]
-    );
-  } catch (err: any) {
-    // If UPSERT fails (e.g., no unique constraint), try regular INSERT
-    if (err.code === '23505' || err.message?.includes('unique constraint')) {
-      // Unique constraint violation - try UPDATE instead
-      try {
-        await pool.query(
-          `UPDATE link_scans SET
-            user_id = COALESCE($1, user_id),
-            domain = $2,
-            link_text = $3,
-            detected_issues = $4,
-            trust_score = $5,
-            gpt_summary = COALESCE($6, gpt_summary),
-            ollama_analysis = COALESCE($7, ollama_analysis),
-            external_checks = COALESCE($8, external_checks),
-            recommendation = COALESCE($9, recommendation),
-            risk_tags = COALESCE($10, risk_tags),
-            confidence = COALESCE($11, confidence),
-            category = $12,
-            updated_at = NOW()
-          WHERE url = $13 AND created_at > NOW() - INTERVAL '${CACHE_TTL_HOURS} hours'`,
-          [
-            userId,
-            link.targetDomain,
-            link.text,
-            JSON.stringify(verdict.issues),
-            verdict.trustScore,
-            verdict.gptSummary || null,
-            ollamaResult ? JSON.stringify(ollamaResult) : null,
-            externalResult ? JSON.stringify(externalResult) : null,
-            verdict.recommendation || null,
-            verdict.riskTags ? JSON.stringify(verdict.riskTags) : null,
-            verdict.confidence || null,
-            verdict.category,
-            normalizedUrl
-          ]
-        );
-      } catch (updateErr) {
-        // If update didn't affect any rows, insert new
-        await pool.query(
-          `INSERT INTO link_scans (
-            user_id, domain, url, link_text, detected_issues, trust_score, 
-            gpt_summary, ollama_analysis, external_checks, recommendation, 
-            risk_tags, confidence, category
-          )
-          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)`,
-          [
-            userId,
-            link.targetDomain,
-            normalizedUrl,
-            link.text,
-            JSON.stringify(verdict.issues),
-            verdict.trustScore,
-            verdict.gptSummary || null,
-            ollamaResult ? JSON.stringify(ollamaResult) : null,
-            externalResult ? JSON.stringify(externalResult) : null,
-            verdict.recommendation || null,
-            verdict.riskTags ? JSON.stringify(verdict.riskTags) : null,
-            verdict.confidence || null,
-            verdict.category
-          ]
-        );
+  // Check if storage is already in progress for this URL
+  const existingStorage = storageLocks.get(normalizedUrl);
+  if (existingStorage) {
+    // Wait for existing storage to complete
+    await existingStorage;
+    return;
+  }
+  
+  // Create storage promise and lock it
+  const storagePromise = (async () => {
+    try {
+      // First, check if a recent result exists (within cache TTL)
+      const cacheCutoff = new Date(Date.now() - CACHE_TTL_MS);
+      const existingResult = await pool.query(
+        `SELECT id, created_at, gpt_summary, confidence FROM link_scans 
+         WHERE url = $1 AND created_at > $2 
+         ORDER BY created_at DESC LIMIT 1`,
+        [normalizedUrl, cacheCutoff]
+      );
+      
+      if (existingResult.rows.length > 0) {
+        // Update existing record (only if we have new AI analysis or better data)
+        const existing = existingResult.rows[0];
+        const shouldUpdate = ollamaResult || 
+                           (verdict.gptSummary && !existing.gpt_summary) ||
+                           (verdict.confidence && verdict.confidence > (parseFloat(existing.confidence) || 0));
+        
+        if (shouldUpdate) {
+          await pool.query(
+            `UPDATE link_scans SET
+              user_id = COALESCE($1, user_id),
+              domain = $2,
+              link_text = $3,
+              detected_issues = $4,
+              trust_score = $5,
+              gpt_summary = COALESCE($6, gpt_summary),
+              ollama_analysis = COALESCE($7, ollama_analysis),
+              external_checks = COALESCE($8, external_checks),
+              recommendation = COALESCE($9, recommendation),
+              risk_tags = COALESCE($10, risk_tags),
+              confidence = COALESCE($11, confidence),
+              category = $12,
+              updated_at = NOW()
+            WHERE id = $13`,
+            [
+              userId,
+              link.targetDomain,
+              link.text,
+              JSON.stringify(verdict.issues),
+              verdict.trustScore,
+              verdict.gptSummary || null,
+              ollamaResult ? JSON.stringify(ollamaResult) : null,
+              externalResult ? JSON.stringify(externalResult) : null,
+              verdict.recommendation || null,
+              verdict.riskTags ? JSON.stringify(verdict.riskTags) : null,
+              verdict.confidence || null,
+              verdict.category,
+              existing.id
+            ]
+          );
+        }
+        // If no update needed, just return (don't create duplicate)
+        return;
       }
-    } else {
-      // Other error - try simple INSERT
+      
+      // No existing record - insert new one
+      // Use INSERT with ON CONFLICT to handle race conditions
       await pool.query(
         `INSERT INTO link_scans (
           user_id, domain, url, link_text, detected_issues, trust_score, 
           gpt_summary, ollama_analysis, external_checks, recommendation, 
-          risk_tags, confidence, category
+          risk_tags, confidence, category, updated_at
         )
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)`,
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, NOW())
+        ON CONFLICT (url) 
+        DO UPDATE SET
+          user_id = COALESCE(EXCLUDED.user_id, link_scans.user_id),
+          domain = EXCLUDED.domain,
+          link_text = EXCLUDED.link_text,
+          detected_issues = EXCLUDED.detected_issues,
+          trust_score = EXCLUDED.trust_score,
+          gpt_summary = COALESCE(EXCLUDED.gpt_summary, link_scans.gpt_summary),
+          ollama_analysis = COALESCE(EXCLUDED.ollama_analysis, link_scans.ollama_analysis),
+          external_checks = COALESCE(EXCLUDED.external_checks, link_scans.external_checks),
+          recommendation = COALESCE(EXCLUDED.recommendation, link_scans.recommendation),
+          risk_tags = COALESCE(EXCLUDED.risk_tags, link_scans.risk_tags),
+          confidence = COALESCE(EXCLUDED.confidence, link_scans.confidence),
+          category = EXCLUDED.category,
+          updated_at = NOW()
+        WHERE link_scans.created_at > NOW() - INTERVAL '${CACHE_TTL_HOURS} hours'`,
         [
           userId,
           link.targetDomain,
@@ -997,6 +988,82 @@ async function storeScanResult(
           verdict.category
         ]
       );
+    } catch (err: any) {
+      // If UPSERT fails (e.g., no unique constraint), try regular INSERT
+      if (err.code === '23505' || err.message?.includes('unique constraint')) {
+        // Unique constraint violation - try UPDATE instead
+        try {
+          await pool.query(
+            `UPDATE link_scans SET
+              user_id = COALESCE($1, user_id),
+              domain = $2,
+              link_text = $3,
+              detected_issues = $4,
+              trust_score = $5,
+              gpt_summary = COALESCE($6, gpt_summary),
+              ollama_analysis = COALESCE($7, ollama_analysis),
+              external_checks = COALESCE($8, external_checks),
+              recommendation = COALESCE($9, recommendation),
+              risk_tags = COALESCE($10, risk_tags),
+              confidence = COALESCE($11, confidence),
+              category = $12,
+              updated_at = NOW()
+            WHERE url = $13 AND created_at > NOW() - INTERVAL '${CACHE_TTL_HOURS} hours'`,
+            [
+              userId,
+              link.targetDomain,
+              link.text,
+              JSON.stringify(verdict.issues),
+              verdict.trustScore,
+              verdict.gptSummary || null,
+              ollamaResult ? JSON.stringify(ollamaResult) : null,
+              externalResult ? JSON.stringify(externalResult) : null,
+              verdict.recommendation || null,
+              verdict.riskTags ? JSON.stringify(verdict.riskTags) : null,
+              verdict.confidence || null,
+              verdict.category,
+              normalizedUrl
+            ]
+          );
+        } catch (updateErr) {
+          // If update didn't affect any rows, insert new
+          await pool.query(
+            `INSERT INTO link_scans (
+              user_id, domain, url, link_text, detected_issues, trust_score, 
+              gpt_summary, ollama_analysis, external_checks, recommendation, 
+              risk_tags, confidence, category
+            )
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)`,
+            [
+              userId,
+              link.targetDomain,
+              normalizedUrl,
+              link.text,
+              JSON.stringify(verdict.issues),
+              verdict.trustScore,
+              verdict.gptSummary || null,
+              ollamaResult ? JSON.stringify(ollamaResult) : null,
+              externalResult ? JSON.stringify(externalResult) : null,
+              verdict.recommendation || null,
+              verdict.riskTags ? JSON.stringify(verdict.riskTags) : null,
+              verdict.confidence || null,
+              verdict.category
+            ]
+          );
+        }
+      } else {
+        // Other error - log it but don't throw (non-critical)
+        console.error(`[DB] Failed to store scan result for ${normalizedUrl}:`, err);
+      }
+    } finally {
+      // Always remove lock when done
+      storageLocks.delete(normalizedUrl);
     }
-  }
+  })();
+  
+  // Store the promise in the lock map
+  storageLocks.set(normalizedUrl, storagePromise);
+  
+  // Await the storage to complete
+  await storagePromise;
 }

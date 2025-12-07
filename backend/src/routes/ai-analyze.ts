@@ -5,6 +5,29 @@ import { authenticateToken, AuthRequest } from '../middleware/auth.js';
 
 export const aiAnalyzeRouter = Router();
 
+// Request deduplication: track ongoing analyses by request signature
+const ongoingAnalyses = new Map<string, Promise<any>>();
+
+function getRequestSignature(links: any[], domain: string): string {
+  // Create a signature from normalized URLs and domain
+  const normalizedUrls = links
+    .map((link: any) => {
+      try {
+        const u = new URL(link.href);
+        u.hash = '';
+        if (u.pathname.endsWith('/') && u.pathname.length > 1) {
+          u.pathname = u.pathname.slice(0, -1);
+        }
+        return u.href;
+      } catch {
+        return link.href;
+      }
+    })
+    .sort()
+    .join('|');
+  return `${domain}:${normalizedUrls}`;
+}
+
 /**
  * Analyze links with AI (prioritized for clicked links)
  * This endpoint returns initial results immediately, then streams AI updates
@@ -65,16 +88,35 @@ aiAnalyzeRouter.post('/', rateLimiter, async (req: AuthRequest, res) => {
       return res.json({ analyses: [] });
     }
     
+    // Check if same request is already being processed
+    const requestSignature = getRequestSignature(sanitizedLinks, domain);
+    const existingAnalysis = ongoingAnalyses.get(requestSignature);
+    
+    if (existingAnalysis) {
+      // Wait for existing analysis to complete
+      console.log(`[AI Analyze] Deduplicating request - waiting for existing analysis`);
+      const analyses = await existingAnalysis;
+      return res.json({ analyses });
+    }
+    
     console.log(`[AI Analyze] Processing ${sanitizedLinks.length} links, priority: ${priorityUrl || 'none'}`);
     
-    // Analyze with AI (parallel processing, priority for clicked link)
-    const analyses = await analyzeLinksWithAI(
+    // Create analysis promise and store it
+    const analysisPromise = analyzeLinksWithAI(
       sanitizedLinks,
       domain,
       userId,
       sourcePageContext || '',
       priorityUrl
-    );
+    ).finally(() => {
+      // Remove from ongoing analyses when done
+      ongoingAnalyses.delete(requestSignature);
+    });
+    
+    ongoingAnalyses.set(requestSignature, analysisPromise);
+    
+    // Analyze with AI (parallel processing, priority for clicked link)
+    const analyses = await analysisPromise;
     
     res.json({ analyses });
   } catch (err) {
