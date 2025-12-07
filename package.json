@@ -1,0 +1,33 @@
+{
+  "name": "smarttrust",
+  "version": "0.1.0",
+  "description": "SmartTrust - AI-powered link trust verifier browser extension",
+  "private": true,
+  "workspaces": [
+    "extension",
+    "backend"
+  ],
+  "scripts": {
+    "build": "npm run build --workspaces",
+    "test": "npm run test --workspaces",
+    "lint": "npm run lint --workspaces",
+    "setup": "cd backend && npm run setup",
+    "migrate": "cd backend && npm run migrate",
+    "dev": "cd backend && npm run dev",
+    "start": "cd backend && npm run dev",
+    "start:backend": "cd backend && npm run dev",
+    "start:extension": "cd extension && npm run dev",
+    "fix-db": "cd backend && npm run fix-db",
+    "grant-permissions": "cd backend && npm run grant-permissions",
+    "setup-db": "cd backend && npm run setup-db-complete",
+    "check-env": "cd backend && npm run check-env",
+    "docker:up": "docker-compose up -d",
+    "docker:down": "docker-compose down",
+    "docker:logs": "docker-compose logs -f"
+  },
+  "devDependencies": {
+    "@types/node": "^20.10.0",
+    "typescript": "^5.3.3"
+  }
+}
+
