@@ -948,51 +948,35 @@ async function storeScanResult(
       }
       
       // No existing record - insert new one
-      // Use INSERT with ON CONFLICT to handle race conditions
-      await pool.query(
-        `INSERT INTO link_scans (
-          user_id, domain, url, link_text, detected_issues, trust_score, 
-          gpt_summary, ollama_analysis, external_checks, recommendation, 
-          risk_tags, confidence, category, updated_at
-        )
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, NOW())
-        ON CONFLICT (url) 
-        DO UPDATE SET
-          user_id = COALESCE(EXCLUDED.user_id, link_scans.user_id),
-          domain = EXCLUDED.domain,
-          link_text = EXCLUDED.link_text,
-          detected_issues = EXCLUDED.detected_issues,
-          trust_score = EXCLUDED.trust_score,
-          gpt_summary = COALESCE(EXCLUDED.gpt_summary, link_scans.gpt_summary),
-          ollama_analysis = COALESCE(EXCLUDED.ollama_analysis, link_scans.ollama_analysis),
-          external_checks = COALESCE(EXCLUDED.external_checks, link_scans.external_checks),
-          recommendation = COALESCE(EXCLUDED.recommendation, link_scans.recommendation),
-          risk_tags = COALESCE(EXCLUDED.risk_tags, link_scans.risk_tags),
-          confidence = COALESCE(EXCLUDED.confidence, link_scans.confidence),
-          category = EXCLUDED.category,
-          updated_at = NOW()
-        WHERE link_scans.created_at > NOW() - INTERVAL '${CACHE_TTL_HOURS} hours'`,
-        [
-          userId,
-          link.targetDomain,
-          normalizedUrl,
-          link.text,
-          JSON.stringify(verdict.issues),
-          verdict.trustScore,
-          verdict.gptSummary || null,
-          ollamaResult ? JSON.stringify(ollamaResult) : null,
-          externalResult ? JSON.stringify(externalResult) : null,
-          verdict.recommendation || null,
-          verdict.riskTags ? JSON.stringify(verdict.riskTags) : null,
-          verdict.confidence || null,
-          verdict.category
-        ]
-      );
-    } catch (err: any) {
-      // If UPSERT fails (e.g., no unique constraint), try regular INSERT
-      if (err.code === '23505' || err.message?.includes('unique constraint')) {
-        // Unique constraint violation - try UPDATE instead
-        try {
+      // Try INSERT first, if it fails due to duplicate, update instead
+      try {
+        await pool.query(
+          `INSERT INTO link_scans (
+            user_id, domain, url, link_text, detected_issues, trust_score, 
+            gpt_summary, ollama_analysis, external_checks, recommendation, 
+            risk_tags, confidence, category, updated_at
+          )
+          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, NOW())`,
+          [
+            userId,
+            link.targetDomain,
+            normalizedUrl,
+            link.text,
+            JSON.stringify(verdict.issues),
+            verdict.trustScore,
+            verdict.gptSummary || null,
+            ollamaResult ? JSON.stringify(ollamaResult) : null,
+            externalResult ? JSON.stringify(externalResult) : null,
+            verdict.recommendation || null,
+            verdict.riskTags ? JSON.stringify(verdict.riskTags) : null,
+            verdict.confidence || null,
+            verdict.category
+          ]
+        );
+      } catch (insertErr: any) {
+        // If insert fails (e.g., duplicate), try to update existing record
+        if (insertErr.code === '23505' || insertErr.message?.includes('unique') || insertErr.message?.includes('duplicate')) {
+          // Record already exists - update it
           await pool.query(
             `UPDATE link_scans SET
               user_id = COALESCE($1, user_id),
@@ -1025,36 +1009,15 @@ async function storeScanResult(
               normalizedUrl
             ]
           );
-        } catch (updateErr) {
-          // If update didn't affect any rows, insert new
-          await pool.query(
-            `INSERT INTO link_scans (
-              user_id, domain, url, link_text, detected_issues, trust_score, 
-              gpt_summary, ollama_analysis, external_checks, recommendation, 
-              risk_tags, confidence, category
-            )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)`,
-            [
-              userId,
-              link.targetDomain,
-              normalizedUrl,
-              link.text,
-              JSON.stringify(verdict.issues),
-              verdict.trustScore,
-              verdict.gptSummary || null,
-              ollamaResult ? JSON.stringify(ollamaResult) : null,
-              externalResult ? JSON.stringify(externalResult) : null,
-              verdict.recommendation || null,
-              verdict.riskTags ? JSON.stringify(verdict.riskTags) : null,
-              verdict.confidence || null,
-              verdict.category
-            ]
-          );
+        } else {
+          // Re-throw if it's a different error
+          throw insertErr;
         }
-      } else {
-        // Other error - log it but don't throw (non-critical)
-        console.error(`[DB] Failed to store scan result for ${normalizedUrl}:`, err);
       }
+    } catch (err: any) {
+      // Log error but don't throw (non-critical operation)
+      // The in-memory lock and pre-check should prevent most duplicates
+      console.error(`[DB] Failed to store scan result for ${normalizedUrl}:`, err);
     } finally {
       // Always remove lock when done
       storageLocks.delete(normalizedUrl);
